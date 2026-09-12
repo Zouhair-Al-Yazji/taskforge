@@ -38,3 +38,11 @@ def get_job(job_id: str):
     if len(results) > 1:
         raise AmbiguousIdentifierError(results)
     return results[0]
+
+
+def list_jobs(status: str | None, limit: int = 10):
+    return db.get_jobs(status, limit)
+
+
+def count_jobs(status: str | None) -> int:
+    return db.count_jobs(status)

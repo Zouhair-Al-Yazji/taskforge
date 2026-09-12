@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskforge"
+version = "0.1.0"
+description = "A modular, SQLite-backed CLI job queue"
+requires-python = ">=3.10"
+
+[project.scripts]
+taskforge = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "job", "db", "main", "worker", "utils"]

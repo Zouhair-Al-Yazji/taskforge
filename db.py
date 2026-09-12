@@ -1,7 +1,8 @@
 import contextlib
 import sqlite3
+from pathlib import Path
 
-DB_PATH = "taskforge.db"
+DB_PATH = Path(__file__).parent / "taskforge.db"
 
 
 @contextlib.contextmanager
@@ -89,3 +90,31 @@ def complete_job(job_id: str, result: str):
             "UPDATE jobs SET result = ?, status = 'COMPLETED' WHERE id = ?",
             (result, job_id),
         )
+
+
+def get_jobs(status: str | None, limit: int = 10):
+    with get_db() as conn:
+        if status:
+            cursor = conn.execute(
+                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        return cursor.fetchall()
+
+
+def count_jobs(status: str | None) -> int:
+    with get_db() as conn:
+        if status:
+            cursor = conn.execute(
+                "SELECT COUNT(*) from jobs WHERE status = ?", (status,)
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT COUNT(*) from jobs",
+            )
+        return cursor.fetchone()[0]
