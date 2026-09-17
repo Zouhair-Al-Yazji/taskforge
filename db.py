@@ -53,9 +53,7 @@ def select_job_by_prefix(short_id: str):
     """Retrieves a single job by its ID. Returns None if not found."""
     pattern = f"{short_id}%"
     with get_db() as conn:
-        cursor = conn.execute(
-            "SELECT id, type, status, created_at FROM jobs WHERE id LIKE ?", (pattern,)
-        )
+        cursor = conn.execute("SELECT * FROM jobs WHERE id LIKE ?", (pattern,))
         return cursor.fetchall()
 
 

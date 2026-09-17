@@ -67,7 +67,8 @@ def main():
             print(f"ID:          {current_job['id'][:8]}")
             print(f"TYPE:        {current_job['type']}")
             print(f"STATUS:      {current_job['status']}")
-            print(f"CREATED AT:  {current_job['created_at']}")
+            print(f"WORKER ID:   {current_job['worker_id'][:8]}")
+            print(f"CREATED AT:  {utils.format_date(current_job['created_at'])}")
             print("-----------------------------\n")
         except job.AmbiguousIdentifierError as e:
             print(f"Error: short ID '{args.job_id}' is ambiguous", file=sys.stderr)
