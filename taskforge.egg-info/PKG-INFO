@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: taskforge
-Version: 0.1.0
-Summary: A modular, SQLite-backed CLI job queue
-Requires-Python: >=3.10
