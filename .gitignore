@@ -1,0 +1,7 @@
+taskforge.db
+
+__pycache__/
+
+taskforge.egg-info/
+
+.vscode/

@@ -1,34 +1,72 @@
+import os
+import socket
 import time
 import uuid
 
-import db
+import job
 
 
-def execute_job(job, worker_id: str):
-    short_job_id = job["id"][:8]
+def execute_job(current_job: dict, worker_id: str):
+    short_job_id = current_job["id"][:8]
     short_worker_id = worker_id[:8]
-    print(f"[{short_worker_id}] Processing job {short_job_id} ({job['type']})...")
+    fence_token = current_job["fence_token"]
+
+    print(
+        f"[{short_worker_id}] Executing job {short_job_id} ({current_job['type']}) [Token: {fence_token}]..."
+    )
     try:
         time.sleep(3)
-        db.complete_job(job["id"], '{"result": "completed"}')
-        print(f"[{short_worker_id}] Job {short_job_id} COMPLETED")
+        status = job.complete(
+            current_job["id"], worker_id, fence_token, '{"status": "ok"}'
+        )
+        if status == "FENCED_OUT":
+            print(
+                f"[{short_worker_id}] FENCED OUT on job {short_job_id}. Marking audit trail..."
+            )
+            job.mark_fenced_out(current_job["id"], worker_id, fence_token)
+        else:
+            print(f"[{short_worker_id}] Job {short_job_id} COMPLETED successfully.")
     except Exception as e:
-        db.fail_job(job["id"], str(e))
-        print(f"[{short_worker_id}] Job {short_job_id} FAILED: {e}")
+        status = job.fail(current_job["id"], worker_id, fence_token, str(e))
+        if status == "FENCED_OUT":
+            print(
+                f"[{short_worker_id}] FENCED OUT on job {short_job_id}. Marking audit trail..."
+            )
+            job.mark_fenced_out(current_job["id"], worker_id, fence_token)
+        else:
+            print(f"[{short_worker_id}] Job {short_job_id} FAILED: {e}")
 
 
 def run_worker():
     worker_id = str(uuid.uuid4())
-    print(f"Worker {worker_id[:8]} started. Polling for jobs...")
+    job.register_worker(worker_id, socket.gethostname(), os.getpid())
+    print(f"Worker {worker_id[:8]} online. Polling job queue...")
+
+    last_heartbeat = time.time()
+    last_sweep = time.time()
+
     while True:
-        job = db.get_next_pending_job()
-        if not job:
+        now = time.time()
+
+        if now - last_heartbeat > 5:
+            job.heartbeat(worker_id)
+            last_heartbeat = now
+
+        if now - last_sweep > 15:
+            recovered = job.recover_stale()
+            exhausted = job.cleanup_exhausted()
+            if recovered > 0 or exhausted > 0:
+                print(
+                    f"[Sweeper] Recovered {recovered} stale job(s); failed {exhausted} exhausted job(s)."
+                )
+            last_sweep = now
+
+        current_job = job.claim_next(worker_id)
+        if not current_job:
             time.sleep(2)
             continue
-        rows = db.claim_job(job["id"], worker_id)
-        if rows == 0:
-            continue
-        execute_job(job, worker_id)
+
+        execute_job(current_job, worker_id)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import cli
-import db
+import job
 
 if __name__ == "__main__":
-    db.init_db()
+    job.init_system()
     cli.main()
