@@ -7,6 +7,8 @@ import worker
 
 
 def main():
+    job.init_system()
+
     parser = argparse.ArgumentParser(
         prog="taskforge", description="Taskforge Job Queue"
     )
@@ -108,3 +110,7 @@ def main():
 
         print("─" * 55)
         print(f"Showing {showing_jobs} of {total_jobs} jobs")
+
+
+if __name__ == "__main__":
+    main()

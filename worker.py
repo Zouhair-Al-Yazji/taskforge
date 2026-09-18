@@ -43,7 +43,6 @@ def run_worker():
     print(f"Worker {worker_id[:8]} online. Polling job queue...")
 
     last_heartbeat = time.time()
-    last_sweep = time.time()
 
     while True:
         now = time.time()
@@ -51,15 +50,6 @@ def run_worker():
         if now - last_heartbeat > 5:
             job.heartbeat(worker_id)
             last_heartbeat = now
-
-        if now - last_sweep > 15:
-            recovered = job.recover_stale()
-            exhausted = job.cleanup_exhausted()
-            if recovered > 0 or exhausted > 0:
-                print(
-                    f"[Sweeper] Recovered {recovered} stale job(s); failed {exhausted} exhausted job(s)."
-                )
-            last_sweep = now
 
         current_job = job.claim_next(worker_id)
         if not current_job:

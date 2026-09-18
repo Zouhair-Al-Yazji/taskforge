@@ -23,7 +23,7 @@ def init_db() -> None:
     with get_db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript("""
-            CREATE TABLE IF NOT EXIST workers (
+            CREATE TABLE IF NOT EXISTS workers (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'ALIVE' CHECK(status IN ('ALIVE', 'OFFLINE')),
                 hostname TEXT NOT NULL,
@@ -32,7 +32,7 @@ def init_db() -> None:
                 started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             
-            CREATE TABLE IF NOT EXIST jobs (
+            CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
                 payload TEXT NOT NULL,
@@ -42,8 +42,8 @@ def init_db() -> None:
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
                 max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                claimed_at DATETIME NOT NULL,
-                completed_at DATETIME NOT NULL,
+                claimed_at DATETIME NULL,
+                completed_at DATETIME NULL,
                 err_message TEXT NULL,
                 result TEXT NULL,
                 CHECK (
@@ -55,7 +55,7 @@ def init_db() -> None:
                 )
             );
             
-            CREATE TABLE IF NOT EXIST jobs_attempts (
+            CREATE TABLE IF NOT EXISTS job_attempts (
                 id TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
                 worker_id TEXT NOT NULL,
@@ -68,8 +68,8 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
             );
             
-            CREATE INDEX IF NOT EXIST idx_jobs_poll ON jobs(status, created_at);
-            CREATE INDEX IF NOT EXIST idx_job_attempts_lookup ON jobs_attempts(job_id, fence_token);
+            CREATE INDEX IF NOT EXISTS idx_jobs_poll ON jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_job_attempts_lookup ON job_attempts(job_id, fence_token);
         """)
 
 
@@ -91,7 +91,7 @@ def register_worker(worker_id: str, hostname: str, pid: int) -> None:
             INSERT INTO workers (id, status, hostname, pid, started_at, last_seen) 
             VALUES (?, 'ALIVE', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET
-                status = 'ALIVE'
+                status = 'ALIVE',
                 last_seen = CURRENT_TIMESTAMP  
             """,
             (worker_id, hostname, pid),
@@ -103,8 +103,8 @@ def update_worker_heartbeat(worker_id: str) -> None:
     with get_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "UPDATE worker SET last_seen=CURRENT_TIMESTAMP WHERE id=?",
-            (worker_id),
+            "UPDATE workers SET last_seen=CURRENT_TIMESTAMP WHERE id=?",
+            (worker_id,),
         )
         conn.execute("COMMIT")
 
@@ -186,7 +186,7 @@ def fail_job(job_id: str, worker_id: str, fence_token: int, err_message: str):
             SET status = 'FAILED',
                 completed_at = CURRENT_TIMESTAMP,
                 worker_id = NULL, 
-                error_message = ?,
+                error_message = ?
             WHERE id = ? AND status = 'PROCESSING' AND worker_id = ? AND fence_token = ? 
             """,
             (err_message, job_id, worker_id, fence_token),
@@ -218,7 +218,7 @@ def complete_job(job_id: str, worker_id: str, fence_token: int, result: str) -> 
             SET status = 'COMPLETED',
                 completed_at = CURRENT_TIMESTAMP,
                 worker_id = NULL, 
-                result = ?,
+                result = ?
             WHERE id = ? AND status = 'PROCESSING' AND worker_id = ? AND fence_token = ? 
             """,
             (result, job_id, worker_id, fence_token),
@@ -315,7 +315,7 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                             SET status = 'FAILED',
                                 completed_at = CURRENT_TIMESTAMP,
                                 worker_id = NULL, 
-                                error_message = 'MAX attempt budget exhausted upon recovery.',
+                                error_message = 'MAX attempt budget exhausted upon recovery.'
                             WHERE id = ? AND fence_token = ? 
                             """,
                             (job_id, old_token),
@@ -326,7 +326,7 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                             UPDATE jobs
                             SET status = 'PENDING',
                                 worker_id = NULL,
-                                claimed_at = NULL,
+                                claimed_at = NULL
                             WHERE id = ? AND fence_token = ? 
                             """,
                             (job_id, old_token),
