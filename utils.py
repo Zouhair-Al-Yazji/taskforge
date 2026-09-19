@@ -1,3 +1,5 @@
+import os
+import sys
 from datetime import datetime, timezone
 
 STATUS_CONFIG = {
@@ -7,10 +9,25 @@ STATUS_CONFIG = {
     "FAILED": {"symbol": "✕ ", "color": "\033[31m"},
 }
 COLOR_RESET = "\033[0m"
+STATUS_COLUMN_WIDTH = 14
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
 
 
 def format_date(created_at_str: str) -> str:
-    created_at = datetime.fromisoformat(created_at_str).replace(tzinfo=timezone.utc)
+    if not created_at_str:
+        return "—"
+
+    try:
+        created_at_str = created_at_str.replace(" ", "T", 1)
+        created_at = datetime.fromisoformat(created_at_str).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return str(created_at_str)
+
     now_utc = datetime.now(timezone.utc)
     seconds = int((now_utc - created_at).total_seconds())
     if seconds < 0:
@@ -28,7 +45,8 @@ def format_date(created_at_str: str) -> str:
 def format_status(raw_status: str, use_color: bool = True) -> str:
     config = STATUS_CONFIG.get(raw_status, {"symbol": "• ", "color": ""})
     combined = f"{config['symbol']} {raw_status}"
-    padded = f"{combined:<14}"
+    padded = f"{combined:<{STATUS_COLUMN_WIDTH}}"
+
     if use_color and config["color"]:
         return f"{config['color']}{padded}{COLOR_RESET}"
     return padded

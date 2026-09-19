@@ -1,12 +1,22 @@
+import logging
 import os
+import signal
 import socket
+import sys
 import time
 import uuid
 
 import job
 
+log = logging.getLogger(__name__)
 
-def execute_job(current_job: dict, worker_id: str):
+HEARTBEAT_INTERVAL = 5  # seconds
+SWEEP_INTERVAL = 15  # seconds
+IDLE_POLL_INTERVAL = 2  # seconds
+STALE_THRESHOLD = 30  # must be > HEARTBEAT_INTERVAL * 2
+
+
+def execute_job(current_job: dict, worker_id: str) -> None:
     short_job_id = current_job["id"][:8]
     short_worker_id = worker_id[:8]
     fence_token = current_job["fence_token"]
@@ -15,7 +25,7 @@ def execute_job(current_job: dict, worker_id: str):
         f"[{short_worker_id}] Executing job {short_job_id} ({current_job['type']}) [Token: {fence_token}]..."
     )
     try:
-        time.sleep(3)
+        time.sleep(5)
         status = job.complete(
             current_job["id"], worker_id, fence_token, '{"status": "ok"}'
         )
@@ -33,8 +43,34 @@ def execute_job(current_job: dict, worker_id: str):
                 f"[{short_worker_id}] FENCED OUT on job {short_job_id}. Marking audit trail..."
             )
             job.mark_fenced_out(current_job["id"], worker_id, fence_token)
+        elif status == "RETRY":
+            print(f"[{short_worker_id}] Job {short_job_id} FAILED (will retry): {e}")
         else:
-            print(f"[{short_worker_id}] Job {short_job_id} FAILED: {e}")
+            print(f"[{short_worker_id}] Job {short_job_id} FAILED permanently: {e}")
+
+
+def sweep(worker_id: str) -> None:
+    try:
+        recovered = job.recover_stale(STALE_THRESHOLD)
+    except Exception:
+        log.exception("recover_stale failed")
+        recovered = 0
+
+    try:
+        exhausted = job.cleanup_exhausted()
+    except Exception:
+        log.exception("cleanup_exhausted failed")
+        exhausted = 0
+
+    if recovered or exhausted:
+        print(
+            f"[{worker_id[:8]}] Sweeper: recovered={recovered}, exhausted={exhausted}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def run_worker():
@@ -42,22 +78,57 @@ def run_worker():
     job.register_worker(worker_id, socket.gethostname(), os.getpid())
     print(f"Worker {worker_id[:8]} online. Polling job queue...")
 
+    def shutdown(signum, frame):
+        print(f"\nWorker {worker_id[:8]} shutting down...")
+        try:
+            job.mark_offline(worker_id)
+        except Exception:
+            log.exception("Failed to mark worker offline on shutdown")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
     last_heartbeat = time.time()
+    last_sweep = time.time()
 
     while True:
         now = time.time()
 
-        if now - last_heartbeat > 5:
-            job.heartbeat(worker_id)
+        # Heartbeat
+        if now - last_heartbeat > HEARTBEAT_INTERVAL:
+            try:
+                job.heartbeat(worker_id)
+            except Exception:
+                log.exception("heartbeat failed for worker %s", worker_id)
             last_heartbeat = now
 
-        current_job = job.claim_next(worker_id)
-        if not current_job:
-            time.sleep(2)
+        # Sweep
+        if now - last_sweep > SWEEP_INTERVAL:
+            sweep(worker_id)
+            last_sweep = now
+
+        # Claim + execute
+        try:
+            current_job = job.claim_next(worker_id)
+        except Exception:
+            log.exception("claim_next failed")
+            time.sleep(IDLE_POLL_INTERVAL)
             continue
 
-        execute_job(current_job, worker_id)
+        if not current_job:
+            time.sleep(IDLE_POLL_INTERVAL)
+            continue
+
+        try:
+            execute_job(current_job, worker_id)
+        except Exception:
+            log.exception("execute_job crashed for job %s", current_job["id"])
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     run_worker()
