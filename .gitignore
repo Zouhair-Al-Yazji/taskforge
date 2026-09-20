@@ -1,7 +1,21 @@
-taskforge.db
-
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
 
-taskforge.egg-info/
+# Taskforge runtime
+*.db
+*.db-wal
+*.db-shm
 
+# IDE
 .vscode/
+.idea/
+
+# Tests
+.pytest_cache/
+.coverage

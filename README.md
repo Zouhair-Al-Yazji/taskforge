@@ -1,84 +1,413 @@
-# Task Queue
+# Taskforge
 
-## Problem
+A minimal, reliable background job queue written in pure Python + SQLite.
+No Redis. No RabbitMQ. No Celery. Just a single-file database and a worker
+loop that survives crashes, restarts, and slow jobs.
 
-What problem am I solving?
+Taskforge is designed as a **command-line tool** you install once and use
+across your OS — submit jobs from any shell, run workers in the background,
+and inspect the queue from anywhere.
 
-- Offloading non-critical tasks: Processes that do not need to happen synchronously like sending verification emails can be moved out of the request-response lifecycle to keep the application responsive.
+---
 
-- Error handling and reliability: Background systems allow for automated retry mechanisms (like exponential backoff) if an external service, such as an email provider, fails.
+## Why
 
-## What is a job?
+Most job queues require you to stand up external infrastructure. Taskforge
+takes the opposite approach: everything lives in one SQLite file, and the
+worker is a single Python process. It's ideal for:
 
-Discrete unit of work that is executed outside of the main **request-response** lifecycle.
+- Local development pipelines
+- Small self-hosted services
+- Learning how job queues work under the hood
+- Prototyping before committing to a "real" queue
 
-Instead of making a user wait for a process to finish while they are interacting with an application, the server offloads that piece of work to be processed independently. Key characteristics of a "job" in this context include:
+Despite its simplicity, Taskforge handles the hard parts correctly:
 
-- **Non-synchronous execution**: The job does not need to finish immediately for the user to receive a response from the server.
-- **Encapsulated logic**: It represents a specific function or workflow, such as sending a verification email, resizing an uploaded image, or generating a PDF report.
-- **Serialized data**: To be queued, the job's requirements (like user IDs or file paths) are packaged into a format, often JSON, so it can be passed to a worker process.
-- **Independent processing**: The job is picked up and executed by a worker or consumer running in a separate process, ensuring the main application remains responsive to user traffic.
+- **Fencing tokens** — a crashed worker cannot overwrite the results of the
+  worker that took over its job.
+- **Heartbeats** — long-running jobs keep their lease alive as long as the
+  worker is healthy, even during graceful shutdown.
+- **Stale recovery** — jobs whose workers vanish are automatically requeued
+  and retried up to a per-job attempt budget.
+- **In-process write serialization** — SQLite-safe under concurrent threads.
 
-### Types of Background Tasks
+---
 
-- **One-off tasks**: Single triggers like password reset emails.
-- **Recurring tasks**: Scheduled maintenance or report generation.
-- **Chain tasks**: Parent-child workflows where one task depends on another, such as video encoding followed by thumbnail generation.
-- **Batch tasks**: Triggering many operations simultaneously, like deleting user account data.
+## Requirements
 
-## What can a job do?
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (recommended) or plain `pip`
 
-A job is ideal for any non-critical or time-consuming operation that doesn't need to block your CLI or API response. examples include:
+No third-party runtime dependencies.
 
-- **Data Processing**: Resizing images or encoding videos.
-- **External Service Calls**: Sending emails, push notifications, or making slow API requests.
-- **Maintenance**: Cleaning up temporary files, deleting database records, or purging old sessions.
-- **Reporting**: Generating PDFs or large data exports on a schedule.
+---
 
-## How does a user submit a job?
+## Installation
 
-Users submit jobs via the CLI interface. Submission generates a unique task record, serializes its arguments, writes it to the queue store, and exits immediately with a tracking ID.
+### With `uv` (recommended)
 
-### CLI Interface Specification
+Install Taskforge as an isolated CLI tool. `uv` creates its own virtualenv
+and puts the `taskforge` command on your `PATH`:
 
 ```bash
-# Submit a new job
-$ taskforge submit <task_type> [payload_json_or_args]
-# Output: Created job 12345 (Status: pending)
-
-# Inspect job state
-$ taskforge status <job_id>
-
-# View job listing
-$ taskforge jobs [--status pending|processing|completed|failed]
-
-# Manage worker nodes
-$ taskforge worker start [--concurrency 2]
+git clone https://github.com/<you>/taskforge.git
+cd taskforge
+uv tool install .
 ```
 
-## Job lifecycle
+Verify:
 
-1. **PENDING**: Job created via cli and written to persistent storage.
-2. **PROCESSING**: A worker claims the job, marks it busy, and assign its PID.
-3. **COMPLETED**: The task finishes successfully, execution timing and outputs are saved.
-4. **FAILED**: Task thrown an unhandled exception, if retries remains, state reverts to **PENDING** with a backoff delay, otherwise marked permanently **FAILED**
+```bash
+taskforge --help
+```
 
-## Components
+Because the tool is installed in its own environment, it won't interfere
+with any other Python project on your machine.
 
-What components do I think the system needs?
+### Editable install (for development)
 
-1. **Producer (CLI)**: Validates input parameters, constructs job payloads, generates UUIDs, and writes them to storage.
-2. **Broker / Persistent Storage**: A centralized storage layer (SQLite database or lock-protected JSON file) acting as the queue, holding state across system restarts.
-3. **Worker (Consumer)**: A long-running process loop that periodically polls the store for PENDING tasks, claims them using state locking, executes the logic, and records output/errors.
+If you're hacking on Taskforge itself:
 
-## Best Practices & Design Considerations
+```bash
+uv tool install --editable .
+```
 
-- **Idempotency**: Ensure tasks can be executed multiple times without side effects if retried.
-- **Monitoring & Alerting**: Track queue length, worker health, and error rates using tools like Prometheus and Grafana.
-- **Keep tasks small**: Avoid long-running tasks; break them into smaller, focused units.
+Edits to the source take effect immediately — no reinstall needed.
 
-## First milestone
+### With `pip`
 
-What is the smallest version I can build?
+```bash
+git clone https://github.com/<you>/taskforge.git
+cd taskforge
+pip install .
+```
 
-V1 Flow: submit task -> write JSON -> worker polls JSON -> executes -> updates JSON
+If `taskforge` isn't found after install, add your local bin directory to
+`PATH`:
+
+```bash
+# macOS / Linux (bash)
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+On `uv`, `uv tool update-shell` will do this for you automatically.
+
+### Uninstall
+
+```bash
+uv tool uninstall taskforge       # if installed with uv
+pip uninstall taskforge           # if installed with pip
+```
+
+---
+
+## Quick Start
+
+Open three terminals.
+
+**Terminal 1 — start a worker:**
+
+```bash
+taskforge worker
+```
+
+**Terminal 2 — submit a job:**
+
+```bash
+taskforge submit resize_image '{"file": "photo.jpg", "width": 800}'
+```
+
+Output:
+
+```
+Job submitted successfully! ID: 3f8a1b2c
+```
+
+**Terminal 3 — inspect the queue:**
+
+```bash
+taskforge jobs
+```
+
+```
+ID         TYPE               STATUS         AGE
+───────────────────────────────────────────────────────
+3f8a1b2c   resize_image       ⚙ PROCESSING    2s ago
+───────────────────────────────────────────────────────
+Showing 1 of 1 jobs
+```
+
+---
+
+## Commands
+
+### `taskforge submit <type> <payload>`
+
+Create a new job. The payload must be valid JSON.
+
+```bash
+taskforge submit send_email '{"to": "user@example.com", "subject": "Hi"}'
+```
+
+| Argument  | Description                                          |
+| --------- | ---------------------------------------------------- |
+| `type`    | A short string naming the task (e.g. `resize_image`) |
+| `payload` | A JSON string with the task's parameters             |
+
+**Flags:**
+
+- `-q`, `--quiet` — print only the job ID. Useful for scripting.
+
+```bash
+JOB_ID=$(taskforge submit resize_image '{"file":"x.jpg"}' -q)
+echo "tracking $JOB_ID"
+```
+
+Exit codes: `0` on success, `1` on error.
+
+### `taskforge status <job_id>`
+
+Show full details for a single job. Accepts a full UUID or any unambiguous
+prefix of at least 4 characters.
+
+```bash
+taskforge status 3f8a1b2c
+```
+
+```
+--- Taskforge Job Status ---
+ID:          3f8a1b2c
+TYPE:        resize_image
+STATUS:      PROCESSING
+WORKER ID:   a1b2c3d4
+ATTEMPTS:    1/3
+FENCE TOKEN: 1
+CREATED AT:  5s ago
+CLAIMED AT:  3s ago
+FINISHED AT: —
+-----------------------------
+```
+
+### `taskforge jobs [-n N] [--status STATUS]`
+
+List recent jobs. Defaults to the 10 most recent.
+
+```bash
+taskforge jobs
+taskforge jobs -n 50
+taskforge jobs --status FAILED
+taskforge jobs -n 5 --status COMPLETED
+```
+
+Valid statuses: `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`.
+
+### `taskforge attempts <job_id>`
+
+Show the full attempt history for a job. Useful for debugging retries.
+
+```bash
+taskforge attempts 3f8a1b2c
+```
+
+```
+--- Attempts for job 3f8a1b2c ---
+#    WORKER     TOKEN        STATUS           STARTED          ERROR
+──────────────────────────────────────────────────────────────────────
+1    a1b2c3d4   1            STALE_TIMEOUT    2m ago           Worker missed heartbeat deadline.
+2    e5f6g7h8   2            SUCCESS          30s ago
+```
+
+### `taskforge worker`
+
+Start a background worker. Blocks until interrupted with `Ctrl+C`.
+
+The worker:
+
+- Registers itself in the database on startup
+- Sends a heartbeat every 5 seconds
+- Sweeps for stale jobs every 15 seconds
+- Claims and executes jobs from the queue
+- Gracefully finishes its current job on `SIGINT`/`SIGTERM`
+- Marks itself offline on exit
+
+Run multiple workers in parallel for higher throughput — the fencing
+mechanism keeps them from stepping on each other.
+
+```bash
+# Terminal 1
+taskforge worker
+
+# Terminal 2 — a second worker for parallelism
+taskforge worker
+```
+
+---
+
+## How It Works
+
+### Job Lifecycle
+
+```
+PENDING ──► PROCESSING ──► COMPLETED
+              │
+              │ (retryable failure)
+              ▼
+           PENDING ──► ...
+              │
+              │ (attempts exhausted)
+              ▼
+            FAILED
+```
+
+### Fencing Tokens
+
+Every time a job is claimed, its `fence_token` is incremented. All
+completion/failure writes must include the current token, or they are
+rejected with `FENCED_OUT`.
+
+This prevents this scenario:
+
+1. Worker A claims job X (token = 1).
+2. Worker A freezes (VM pause, network partition, `SIGSTOP`).
+3. Sweeper declares A dead, resets job X.
+4. Worker B claims job X (token = 2).
+5. Worker A wakes up and calls `complete()`.
+6. The DB rejects A's write because `1 ≠ 2`. No corruption.
+
+### Heartbeats and Graceful Shutdown
+
+The worker runs a **dedicated heartbeat thread** independent of the main
+execution loop. When a shutdown signal arrives:
+
+- The main loop stops claiming **new** jobs.
+- The heartbeat thread **keeps running** until the current job finishes.
+- Only after the in-flight job completes does the worker mark itself
+  offline and exit.
+
+This means a 45-second job isn't fenced out by a sweeper just because you
+pressed `Ctrl+C` halfway through.
+
+### Recovery
+
+Any worker can act as a sweeper. Every 15 seconds it:
+
+1. Finds jobs in `PROCESSING` whose worker is `OFFLINE` or hasn't
+   heartbeated within `STALE_THRESHOLD` (30s).
+2. Marks the corresponding attempt `STALE_TIMEOUT`.
+3. Requeues the job (`PENDING`) if attempts remain, or marks it `FAILED`.
+
+### Write Serialization
+
+SQLite allows one writer at a time. Because the worker has two threads
+(main + heartbeat) writing to the DB, `db.py` provides a `write_txn`
+context manager that holds a process-wide lock around every
+`BEGIN IMMEDIATE` transaction. Combined with SQLite's `busy_timeout`,
+this eliminates `database is locked` errors from intra-process
+contention.
+
+---
+
+## Configuration
+
+Tunable constants live at the top of `taskforge/worker.py`:
+
+| Constant             | Default | Purpose                                              |
+| -------------------- | ------- | ---------------------------------------------------- |
+| `HEARTBEAT_INTERVAL` | 5s      | How often the worker pulses the DB                   |
+| `SWEEP_INTERVAL`     | 15s     | How often the worker recovers stale jobs             |
+| `IDLE_POLL_INTERVAL` | 2s      | Sleep time when no jobs are available                |
+| `STALE_THRESHOLD`    | 30s     | Grace period before a silent worker is declared dead |
+
+Rule of thumb: `STALE_THRESHOLD > HEARTBEAT_INTERVAL * 2`.
+
+---
+
+## Project Layout
+
+```
+taskforge/                      ← repo root
+├── taskforge/                  ← the installable package
+│   ├── __init__.py
+│   ├── cli.py                  # argument parsing + user-facing commands
+│   ├── worker.py               # long-running worker loop + heartbeat thread
+│   ├── job.py                  # thin API layer over db.py
+│   ├── db.py                   # SQLite access, transactions, schema
+│   └── utils.py                # formatting helpers
+├── tests/                      # unittest suite
+│   ├── __init__.py
+│   ├── base.py                 # shared TaskforgeTestCase
+│   ├── test_job.py
+│   ├── test_worker_flow.py
+│   ├── test_concurrency.py
+│   └── test_cli.py
+├── pyproject.toml
+├── README.md
+└── LICENSE
+```
+
+---
+
+## Running Tests
+
+The test suite uses Python's built-in `unittest` — no extra dependencies.
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+Or without `uv`:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests cover:
+
+- Job creation and payload validation
+- Claim → complete / fail / retry flows
+- Fencing token enforcement
+- Stale job recovery
+- Concurrent writers (heartbeat vs. main loop)
+- Graceful shutdown behavior
+- CLI command dispatch and exit codes
+
+---
+
+## Development
+
+Clone and install in editable mode:
+
+```bash
+git clone https://github.com/<you>/taskforge.git
+cd taskforge
+uv tool install --editable .
+```
+
+Run a worker against your local DB:
+
+```bash
+taskforge worker
+```
+
+Make a change, then re-run tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+---
+
+## Roadmap
+
+- [ ] Configurable retry backoff
+- [ ] Job priorities
+- [ ] Real task handlers (currently a stub `time.sleep(5)`)
+- [ ] Web dashboard
+- [ ] Postgres backend option
+
+---
+
+## License
+
+MIT

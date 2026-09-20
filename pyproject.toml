@@ -6,10 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "taskforge"
 version = "0.1.0"
 description = "A modular, SQLite-backed CLI job queue"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Your Name", email = "you@example.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
 
 [project.scripts]
-taskforge = "cli:main"
+taskforge = "taskforge.cli:main"
 
-[tool.setuptools]
-py-modules = ["cli", "job", "db", "main", "worker", "utils"]
+[tool.setuptools.packages.find]
+include = ["taskforge*"]

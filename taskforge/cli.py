@@ -1,18 +1,20 @@
 import argparse
 import sys
 
-import job
-import utils
+from taskforge import job, utils
 
 
 def cmd_submit(args) -> int:
     try:
         job_id = job.create_job(args.task_type, args.payload)
-        print(f"Job submitted successfully! ID: {job_id[:8]}")
-        return 1
+        if args.quiet:
+            print(job_id)
+        else:
+            print(f"Job submitted successfully! ID: {job_id[:8]}")
+        return 0
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
-        return 0
+        return 1
 
 
 def cmd_status(args) -> int:
@@ -119,7 +121,7 @@ def cmd_attempts(args) -> int:
 
 
 def cmd_worker(_args) -> int:
-    import worker
+    from taskforge import worker
 
     worker.run_worker()
     return 0

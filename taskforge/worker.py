@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 
-import job
+from taskforge import job
 
 log = logging.getLogger(__name__)
 

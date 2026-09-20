@@ -1,6 +1,6 @@
 import json
 
-import db
+from taskforge import db
 
 
 class AmbiguousIdentifierError(Exception):
