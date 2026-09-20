@@ -2,7 +2,7 @@ import logging
 import os
 import signal
 import socket
-import sys
+import threading
 import time
 import uuid
 
@@ -68,6 +68,15 @@ def sweep(worker_id: str) -> None:
         )
 
 
+def heartbeat_loop(worker_id: str, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            job.heartbeat(worker_id)
+        except Exception:
+            log.exception("heartbeat failed for worker %s", worker_id)
+        stop_event.wait(HEARTBEAT_INTERVAL)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,52 +87,63 @@ def run_worker():
     job.register_worker(worker_id, socket.gethostname(), os.getpid())
     print(f"Worker {worker_id[:8]} online. Polling job queue...")
 
-    def shutdown(signum, frame):
-        print(f"\nWorker {worker_id[:8]} shutting down...")
-        try:
-            job.mark_offline(worker_id)
-        except Exception:
-            log.exception("Failed to mark worker offline on shutdown")
-        sys.exit(0)
+    shutting_down = False
+    hb_stop_event = threading.Event()
+
+    def shutdown(signum, frame, _flag_holder=None):
+        nonlocal shutting_down
+        print(f"\nWorker {worker_id[:8]} received signal. Finishing current job...")
+        shutting_down = True
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    last_heartbeat = time.time()
+    # --- Start the heartbeat thread ---
+    hb_thread = threading.Thread(
+        target=heartbeat_loop,
+        args=(worker_id, hb_stop_event),
+        daemon=True,
+        name=f"heartbeat-{worker_id[:8]}",
+    )
+    hb_thread.start()
+
     last_sweep = time.time()
 
-    while True:
-        now = time.time()
+    try:
+        while not shutting_down:
+            now = time.time()
 
-        # Heartbeat
-        if now - last_heartbeat > HEARTBEAT_INTERVAL:
+            # Sweep
+            if now - last_sweep > SWEEP_INTERVAL:
+                sweep(worker_id)
+                last_sweep = now
+
+            # Claim + execute
             try:
-                job.heartbeat(worker_id)
+                current_job = job.claim_next(worker_id)
             except Exception:
-                log.exception("heartbeat failed for worker %s", worker_id)
-            last_heartbeat = now
+                log.exception("claim_next failed")
+                time.sleep(IDLE_POLL_INTERVAL)
+                continue
 
-        # Sweep
-        if now - last_sweep > SWEEP_INTERVAL:
-            sweep(worker_id)
-            last_sweep = now
+            if not current_job:
+                time.sleep(IDLE_POLL_INTERVAL)
+                continue
 
-        # Claim + execute
-        try:
-            current_job = job.claim_next(worker_id)
-        except Exception:
-            log.exception("claim_next failed")
-            time.sleep(IDLE_POLL_INTERVAL)
-            continue
-
-        if not current_job:
-            time.sleep(IDLE_POLL_INTERVAL)
-            continue
+            try:
+                execute_job(current_job, worker_id)
+            except Exception:
+                log.exception("execute_job crashed for job %s", current_job["id"])
+    finally:
+        hb_stop_event.set()
+        hb_thread.join(timeout=HEARTBEAT_INTERVAL + 1)
 
         try:
-            execute_job(current_job, worker_id)
+            job.mark_offline(worker_id)
         except Exception:
-            log.exception("execute_job crashed for job %s", current_job["id"])
+            log.exception("Failed to mark worker offline")
+
+        print(f"Worker {worker_id[:8]} offline. Goodbye.")
 
 
 if __name__ == "__main__":

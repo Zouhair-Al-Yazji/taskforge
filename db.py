@@ -1,12 +1,15 @@
 import contextlib
 import logging
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "taskforge.db"
+
+_write_lock = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -22,11 +25,19 @@ def get_db():
         conn.close()
 
 
+@contextlib.contextmanager
+def write_txn(conn):
+    with _write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
 def init_db() -> None:
-    """
-    Create tables if they don't exist. NOT a migration tool
-    Schema changes require manual migration or deleting the DB.
-    """
     with get_db() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS workers (
@@ -37,7 +48,7 @@ def init_db() -> None:
                 last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            
+
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
@@ -60,7 +71,7 @@ def init_db() -> None:
                     (status IN ('FAILED','COMPLETED') AND worker_id IS NULL)
                 )
             );
-            
+
             CREATE TABLE IF NOT EXISTS job_attempts (
                 id TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
@@ -72,8 +83,8 @@ def init_db() -> None:
                 status TEXT NOT NULL CHECK(status IN ("IN_PROGRESS","SUCCESS","APP_ERROR","FENCED_OUT","STALE_TIMEOUT")),
                 error_message TEXT NULL,
                 FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-            );  
-                        
+            );
+
             CREATE INDEX IF NOT EXISTS idx_jobs_poll ON jobs(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_job_attempts_lookup ON job_attempts(job_id, fence_token);
             CREATE INDEX IF NOT EXISTS idx_jobs_processing ON jobs(status, worker_id) WHERE status = 'PROCESSING';
@@ -94,13 +105,11 @@ def insert_job(
         raise ValueError("job_type is required")
 
     job_id = job_id or str(uuid.uuid4())
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         conn.execute(
             "INSERT INTO jobs (id, type, payload, max_attempts) VALUES (?, ?, ?, ?)",
             (job_id, job_type, payload, max_attempts),
         )
-        conn.execute("COMMIT")
     return job_id
 
 
@@ -119,21 +128,19 @@ def claim_next_pending_job(worker_id: str):
     if not worker_id:
         raise ValueError("worker_id is required")
 
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         cursor = conn.execute(
             """
-            SELECT id, type, payload, fence_token, attempts, max_attempts 
+            SELECT id, type, payload, fence_token, attempts, max_attempts
             FROM jobs
-            WHERE status = 'PENDING' AND attempts < max_attempts 
-            ORDER BY created_at ASC 
-            LIMIT 1 
+            WHERE status = 'PENDING' AND attempts < max_attempts
+            ORDER BY created_at ASC
+            LIMIT 1
             """
         )
         job = cursor.fetchone()
 
         if not job:
-            conn.execute("ROLLBACK")
             return None
 
         new_fence_token = job["fence_token"] + 1
@@ -141,32 +148,36 @@ def claim_next_pending_job(worker_id: str):
 
         cur = conn.execute(
             """
-            UPDATE jobs 
-            SET status = 'PROCESSING', 
-                fence_token = ?, 
-                attempts = ?, 
-                worker_id = ?, 
-                claimed_at = CURRENT_TIMESTAMP, 
-                completed_at = NULL, 
+            UPDATE jobs
+            SET status = 'PROCESSING',
+                fence_token = ?,
+                attempts = ?,
+                worker_id = ?,
+                claimed_at = CURRENT_TIMESTAMP,
+                completed_at = NULL,
                 error_message = NULL
-            WHERE id = ? AND status = 'PENDING' 
+            WHERE id = ? AND status = 'PENDING'
             """,
             (new_fence_token, new_attempts, worker_id, job["id"]),
         )
 
         if cur.rowcount == 0:
-            conn.execute("ROLLBACK")
             return None
 
         conn.execute(
             """
-            INSERT INTO job_attempts 
-                (id, job_id, worker_id, fence_token, attempt_number, started_at, status) 
+            INSERT INTO job_attempts
+                (id, job_id, worker_id, fence_token, attempt_number, started_at, status)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'IN_PROGRESS')
             """,
-            (str(uuid.uuid4()), job["id"], worker_id, new_fence_token, new_attempts),
+            (
+                str(uuid.uuid4()),
+                job["id"],
+                worker_id,
+                new_fence_token,
+                new_attempts,
+            ),
         )
-        conn.execute("COMMIT")
         return {
             "id": job["id"],
             "type": job["type"],
@@ -178,34 +189,30 @@ def claim_next_pending_job(worker_id: str):
 
 
 def complete_job(job_id: str, worker_id: str, fence_token: int, result: str) -> str:
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         cursor = conn.execute(
             """
-            UPDATE jobs 
+            UPDATE jobs
             SET status = 'COMPLETED',
                 completed_at = CURRENT_TIMESTAMP,
-                worker_id = NULL, 
+                worker_id = NULL,
                 result = ?
-            WHERE id = ? AND status = 'PROCESSING' AND worker_id = ? AND fence_token = ? 
+            WHERE id = ? AND status = 'PROCESSING' AND worker_id = ? AND fence_token = ?
             """,
             (result, job_id, worker_id, fence_token),
         )
 
         if cursor.rowcount == 0:
-            conn.execute("ROLLBACK")
             return "FENCED_OUT"
 
         conn.execute(
             """
             UPDATE job_attempts
             SET status = 'SUCCESS', finished_at = CURRENT_TIMESTAMP
-            WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ? 
+            WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ?
             """,
             (job_id, worker_id, fence_token),
         )
-
-        conn.execute("COMMIT")
         return "COMPLETED"
 
 
@@ -216,27 +223,24 @@ def fail_job(job_id: str, worker_id: str, fence_token: int, err_message: str):
         - "RETRY"      — job reset to PENDING for another attempt
         - "FAILED"     — attempts exhausted; job is terminal
     """
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-
+    with get_db() as conn, write_txn(conn):
         row = conn.execute(
             """
-            SELECT attempts, max_attempts 
+            SELECT attempts, max_attempts
             FROM jobs
-            WHERE id = ? AND fence_token = ? AND worker_id = ? AND status = 'PROCESSING' 
+            WHERE id = ? AND fence_token = ? AND worker_id = ? AND status = 'PROCESSING'
             """,
             (job_id, fence_token, worker_id),
         ).fetchone()
 
         if row is None:
-            conn.execute("ROLLBACK")
             return "FENCED_OUT"
 
         conn.execute(
             """
             UPDATE job_attempts
             SET status = 'APP_ERROR', finished_at = CURRENT_TIMESTAMP, error_message = ?
-            WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ? 
+            WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ?
             """,
             (err_message, job_id, worker_id, fence_token),
         )
@@ -247,13 +251,12 @@ def fail_job(job_id: str, worker_id: str, fence_token: int, err_message: str):
                 UPDATE jobs
                 SET status = 'FAILED',
                     completed_at = CURRENT_TIMESTAMP,
-                    worker_id = NULL, 
+                    worker_id = NULL,
                     error_message = ?
-                WHERE id = ? AND fence_token = ? 
+                WHERE id = ? AND fence_token = ?
                 """,
                 (err_message, job_id, fence_token),
             )
-            conn.execute("COMMIT")
             return "FAILED"
 
         conn.execute(
@@ -261,32 +264,28 @@ def fail_job(job_id: str, worker_id: str, fence_token: int, err_message: str):
             UPDATE jobs
             SET status = 'PENDING',
                 worker_id = NULL,
-                claimed_at = NULL, 
+                claimed_at = NULL,
                 error_message = ?
-            WHERE id = ? AND fence_token = ? 
-                """,
+            WHERE id = ? AND fence_token = ?
+            """,
             (err_message, job_id, fence_token),
         )
-
-        conn.execute("COMMIT")
         return "RETRY"
 
 
 def mark_attempt_fenced_out(job_id: str, worker_id: str, fence_token: int) -> None:
     try:
-        with get_db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with get_db() as conn, write_txn(conn):
             conn.execute(
                 """
                 UPDATE job_attempts
-                SET status = 'FENCED_OUT', 
+                SET status = 'FENCED_OUT',
                     finished_at = CURRENT_TIMESTAMP,
                     error_message = 'Worker lost execution lease prior to completion ACK'
-                WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ? 
+                WHERE job_id = ? AND status = 'IN_PROGRESS' AND worker_id = ? AND fence_token = ?
                 """,
                 (job_id, worker_id, fence_token),
             )
-            conn.execute("COMMIT")
     except sqlite3.Error:
         log.exception("Failed to mark attempt fenced out for job %s", job_id)
 
@@ -303,7 +302,7 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                     OR w.status = 'OFFLINE'
                     OR w.last_seen < datetime('now', '-' || ? || ' seconds')
                 )
-        """,
+            """,
             (heartbeat_threshold_seconds,),
         )
         stale_jobs = cursor.fetchall()
@@ -316,9 +315,8 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
         attempts = j["attempts"]
         max_attempts = j["max_attempts"]
 
-        with get_db() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
+        try:
+            with get_db() as conn, write_txn(conn):
                 check = conn.execute(
                     "SELECT status, fence_token FROM jobs WHERE id = ?", (job_id,)
                 ).fetchone()
@@ -328,7 +326,7 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                     or check["status"] != "PROCESSING"
                     or check["fence_token"] != old_token
                 ):
-                    conn.execute("ROLLBACK")
+                    # Someone else already handled it; commit no-op and move on.
                     continue
 
                 conn.execute(
@@ -338,7 +336,7 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                         finished_at = CURRENT_TIMESTAMP,
                         error_message = 'Worker missed heartbeat deadline.'
                     WHERE job_id = ? AND fence_token = ? AND status = 'IN_PROGRESS'
-                """,
+                    """,
                     (job_id, old_token),
                 )
 
@@ -348,9 +346,9 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                         UPDATE jobs
                         SET status = 'FAILED',
                             completed_at = CURRENT_TIMESTAMP,
-                            worker_id = NULL, 
+                            worker_id = NULL,
                             error_message = 'MAX attempt budget exhausted upon recovery.'
-                        WHERE id = ? AND fence_token = ? 
+                        WHERE id = ? AND fence_token = ?
                         """,
                         (job_id, old_token),
                     )
@@ -361,38 +359,30 @@ def recover_stale_jobs(heartbeat_threshold_seconds: int = 30) -> int:
                         SET status = 'PENDING',
                             worker_id = NULL,
                             claimed_at = NULL
-                        WHERE id = ? AND fence_token = ? 
+                        WHERE id = ? AND fence_token = ?
                         """,
                         (job_id, old_token),
                     )
 
-                conn.execute("COMMIT")
                 recovered += 1
-            except Exception:
-                log.exception("Failed to recover stale job %s", job_id)
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
+        except Exception:
+            log.exception("Failed to recover stale job %s", job_id)
 
     return recovered
 
 
 def cleanup_exhausted_jobs() -> int:
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         cursor = conn.execute(
             """
-            UPDATE jobs
-            SET status = 'FAILED',
-                completed_at = CURRENT_TIMESTAMP,
-                error_message = 'MAX execution attempts exhausted'
-            WHERE status = 'PENDING' AND attempts >= max_attempts 
-            """,
+                UPDATE jobs
+                SET status = 'FAILED',
+                    completed_at = CURRENT_TIMESTAMP,
+                    error_message = 'MAX execution attempts exhausted'
+                WHERE status = 'PENDING' AND attempts >= max_attempts
+                """,
         )
-        count = cursor.rowcount
-        conn.execute("COMMIT")
-        return count
+        return cursor.rowcount
 
 
 JOB_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
@@ -448,36 +438,30 @@ def get_job_attempts(job_id: str):
 
 
 def register_worker(worker_id: str, hostname: str, pid: int) -> None:
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         conn.execute(
             """
-            INSERT INTO workers (id, status, hostname, pid, started_at, last_seen) 
-            VALUES (?, 'ALIVE', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(id) DO UPDATE SET
-                status = 'ALIVE',
-                last_seen = CURRENT_TIMESTAMP  
-            """,
+                INSERT INTO workers (id, status, hostname, pid, started_at, last_seen)
+                VALUES (?, 'ALIVE', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = 'ALIVE',
+                    last_seen = CURRENT_TIMESTAMP
+                """,
             (worker_id, hostname, pid),
         )
-        conn.execute("COMMIT")
 
 
 def update_worker_heartbeat(worker_id: str) -> None:
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         conn.execute(
-            "UPDATE workers SET last_seen = CURRENT_TIMESTAMP,status = 'ALIVE' WHERE id=?",
+            "UPDATE workers SET last_seen = CURRENT_TIMESTAMP, status = 'ALIVE' WHERE id=?",
             (worker_id,),
         )
-        conn.execute("COMMIT")
 
 
 def mark_worker_offline(worker_id: str) -> None:
-    with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with get_db() as conn, write_txn(conn):
         conn.execute(
             "UPDATE workers SET status = 'OFFLINE', last_seen = CURRENT_TIMESTAMP WHERE id = ?",
             (worker_id,),
         )
-        conn.execute("COMMIT")
